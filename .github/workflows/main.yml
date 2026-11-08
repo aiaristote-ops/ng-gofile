@@ -1,12 +1,10 @@
 # ─────────────────────────────────────────────────────────────────
-#  Windows RDP via Ngrok  ·  Enhanced Edition
-#  - Cached ngrok binary (faster cold start)
-#  - NLA off + exponential-backoff tunnel detection (faster connect)
-#  - Ngrok watchdog (auto-restart if the process dies)
-#  - Backup job every BACKUP_INTERVAL_MIN via gofile.io
-#      · 3-channel notification: desktop file + msg.exe + BurntToast
-#      · deletes old remote backup before uploading new one
-#  - Heartbeat every 10 min to keep Actions log alive
+#  Windows RDP via Ngrok  ·  Clean Edition
+#  - Cached ngrok binary
+#  - NLA off (faster connect)
+#  - Exponential-backoff tunnel detection
+#  - Ngrok watchdog (auto-restart on crash)
+#  - Heartbeat every 10 min
 # ─────────────────────────────────────────────────────────────────
 name: Windows RDP via Ngrok
 
@@ -15,7 +13,6 @@ on: [push]
 env:
   RDP_USER: "kamel007"
   RDP_PASS: "Kamel@123"
-  BACKUP_INTERVAL_MIN: "150"   # 2 h 30 m — edit freely
 
 jobs:
   rdp-setup:
@@ -24,426 +21,137 @@ jobs:
 
     steps:
 
-      # ── 1 · Cache ngrok binary ───────────────────────────────────
       - name: Cache Ngrok binary
-        id:   ngrok-cache
+        id: ngrok-cache
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}\_ngrok_cache
-          key:  ngrok-windows-amd64-stable-v1
+          key: ngrok-windows-amd64-stable-v1
 
       - name: Download Ngrok
-        if:    steps.ngrok-cache.outputs.cache-hit != 'true'
+        if: steps.ngrok-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $dest = "$env:GITHUB_WORKSPACE\_ngrok_cache"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          $tmp  = "$env:RUNNER_TEMP\ngrok.zip"
-          Invoke-WebRequest `
-            "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" `
-            -OutFile $tmp -UseBasicParsing
+          $tmp = "$env:RUNNER_TEMP\ngrok.zip"
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile $tmp -UseBasicParsing
           Expand-Archive $tmp -DestinationPath $dest -Force
           Remove-Item $tmp
-          Write-Output "✅ Ngrok downloaded"
+          Write-Output "ngrok downloaded"
 
       - name: Stage Ngrok binary
         shell: pwsh
         run: |
-          Copy-Item "$env:GITHUB_WORKSPACE\_ngrok_cache\ngrok.exe" `
-                    "$env:GITHUB_WORKSPACE\ngrok.exe"
-          Write-Output "✅ ngrok.exe staged"
+          Copy-Item "$env:GITHUB_WORKSPACE\_ngrok_cache\ngrok.exe" "$env:GITHUB_WORKSPACE\ngrok.exe"
+          Write-Output "ngrok.exe staged"
 
-      # ── 2 · Configure RDP and firewall ───────────────────────────
       - name: Configure RDP and Firewall
         shell: pwsh
         run: |
-          # Enable RDP
-          Set-ItemProperty `
-            -Path  "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name  fDenyTSConnections `
-            -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Ngrok" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -ErrorAction SilentlyContinue | Out-Null
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0
+          Write-Output "RDP and firewall configured"
 
-          # Firewall
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
-            -ErrorAction SilentlyContinue
-          New-NetFirewallRule `
-            -DisplayName "RDP-Ngrok" `
-            -Direction   Inbound `
-            -Action      Allow `
-            -Protocol    TCP `
-            -LocalPort   3389 `
-            -ErrorAction SilentlyContinue | Out-Null
-
-          # Disable NLA (Network Level Authentication)
-          # Removes the credential pre-auth step → faster, wider client compat
-          Set-ItemProperty `
-            -Path  "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name  UserAuthentication `
-            -Value 0
-
-          Write-Output "✅ RDP and firewall configured"
-
-      # ── 3 · Create admin user ─────────────────────────────────────
       - name: Create Admin User
         shell: pwsh
         run: |
-          $u = $env:RDP_USER
-          $p = $env:RDP_PASS
-          net user $u $p /add
-          net localgroup administrators $u /add
-          net user $u /expires:never
-          # Disable password expiry via WMI (best-effort)
-          try {
-            $obj = Get-WmiObject Win32_UserAccount -Filter "Name='$u'" -EA Stop
-            $obj.PasswordExpires = $false
-            $obj.Put() | Out-Null
-          } catch {}
-          Write-Output "✅ User created: $u"
+          net user $env:RDP_USER $env:RDP_PASS /add
+          net localgroup administrators $env:RDP_USER /add
+          net user $env:RDP_USER /expires:never
+          Write-Output "User created: $env:RDP_USER"
 
-      # ── 4 · Authenticate ngrok ────────────────────────────────────
       - name: Authenticate Ngrok
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           & "$env:GITHUB_WORKSPACE\ngrok.exe" authtoken "${{ secrets.NGROK_AUTH_TOKEN }}"
-          Write-Output "✅ Ngrok authenticated"
+          Write-Output "Ngrok authenticated"
 
-      # ── 5 · Session: tunnel + backup loop + keepalive ─────────────
       - name: Run Session
         shell: pwsh
         run: |
           $ws      = $env:GITHUB_WORKSPACE
           $rdpUser = $env:RDP_USER
           $rdpPass = $env:RDP_PASS
-          $bkpMin  = [int]$env:BACKUP_INTERVAL_MIN
           $logFile = "$ws\ngrok.log"
 
-          # ── BurntToast (Windows toast notifications over RDP) ──
-          $toastOk = $false
-          try {
-            if (-not (Get-Module -ListAvailable BurntToast -EA SilentlyContinue)) {
-              Install-Module BurntToast -Force -Scope CurrentUser `
-                -SkipPublisherCheck -EA Stop
-            }
-            Import-Module BurntToast -EA Stop
-            $toastOk = $true
-            Write-Output "✅ BurntToast ready"
-          } catch {
-            Write-Output "⚠️  BurntToast unavailable — desktop file + msg.exe only"
-          }
-
-          # ── 3-channel notification helper ──────────────────────
-          #   Channel 1: GitHub Actions log  (always)
-          #   Channel 2: Desktop status file (always, visible in RDP)
-          #   Channel 3: msg.exe popup       (needs active RDP session)
-          #   Channel 4: BurntToast toast    (if module installed)
-          function Notify {
-            param([string]$Title, [string]$Body)
-            $line = "[$( Get-Date -Format 'HH:mm:ss' )] $Title — $Body"
-            Write-Output "🔔 $line"
-            # Desktop file
-            $desk = "C:\Users\$rdpUser\Desktop"
-            if (Test-Path $desk) {
-              try { $line | Out-File "$desk\backup-status.txt" -Append -Encoding UTF8 } catch {}
-            }
-            # msg.exe popup
-            try { & msg $rdpUser "/time:60" "$Title`: $Body" > $null 2>&1 } catch {}
-            # Toast
-            if ($toastOk) {
-              try { New-BurntToastNotification -Text $Title, $Body -EA SilentlyContinue } catch {}
-            }
-          }
-
-          # ── gofile.io API helpers ───────────────────────────────
-          function Get-GoServer {
-            try {
-              $r  = Invoke-RestMethod "https://api.gofile.io/servers" -EA Stop
-              $eu = $r.data.servers | Where-Object { $_.zone -eq "eu" } |
-                    Select-Object -First 1
-              return $(if ($eu) { $eu.name } else { ($r.data.servers)[0].name })
-            } catch { return "store1" }
-          }
-
-          # Requires PS 7.1+ (-Form); windows-latest ships PS 7.4
-          function Upload-GoFile {
-            param([string]$FilePath)
-            try {
-              $resp = Invoke-RestMethod `
-                "https://$( Get-GoServer ).gofile.io/contents/uploadfile" `
-                -Method Post -Form @{ file = Get-Item $FilePath } -EA Stop
-              if ($resp.status -eq "ok") { return $resp.data }
-            } catch {
-              Write-Output "    ⚠️  Gofile upload error: $_"
-            }
-            return $null
-          }
-
-          function Remove-GoFile {
-            param([string]$Id, [string]$Token)
-            if (-not $Id -or -not $Token) { return }
-            try {
-              Invoke-RestMethod "https://api.gofile.io/contents/$Id" `
-                -Method  Delete `
-                -Headers @{ Authorization = "Bearer $Token" } `
-                -EA Stop | Out-Null
-              Write-Output "    🗑️  Deleted remote backup [$Id]"
-            } catch {
-              Write-Output "    ⚠️  Remote delete failed: $_"
-            }
-          }
-
-          # ── ngrok process helper ────────────────────────────────
           function Start-Ngrok {
             return Start-Process "$ws\ngrok.exe" `
               -ArgumentList "tcp 3389 --log=stdout --log-format=json" `
               -NoNewWindow -RedirectStandardOutput $logFile -PassThru
           }
 
-          # ── start ngrok ─────────────────────────────────────────
           $ngrokProc = Start-Ngrok
           Write-Output "Ngrok PID: $($ngrokProc.Id)"
 
-          # Exponential backoff — 2+2+3+3+5+5+10+10+10+10 = 60s max wait
           $tunnelUrl = $null
           foreach ($wait in 2,2,3,3,5,5,10,10,10,10) {
             Start-Sleep $wait
-            # Try management API first
             try {
-              $tunnels = (Invoke-RestMethod "http://localhost:4040/api/tunnels" -EA Stop).tunnels
+              $tunnels = (Invoke-RestMethod "http://localhost:4040/api/tunnels" -ErrorAction Stop).tunnels
               if ($tunnels.Count -gt 0) {
                 $tunnelUrl = $tunnels[0].public_url -replace "tcp://", ""
                 break
               }
             } catch {}
-            # Fallback: parse the JSON log file
-            $hit = Get-Content $logFile -EA SilentlyContinue |
-                   Select-String '"url":"tcp://([^"]+)"' | Select-Object -Last 1
-            if ($hit) { $tunnelUrl = $hit.Matches.Groups[1].Value; break }
+            $hit = Get-Content $logFile -ErrorAction SilentlyContinue |
+                   Select-String '"url":"tcp://([^"]+)"' |
+                   Select-Object -Last 1
+            if ($hit) {
+              $tunnelUrl = $hit.Matches.Groups[1].Value
+              break
+            }
           }
 
           if (-not $tunnelUrl) {
             Write-Output "::error::Ngrok tunnel failed to start"
-            Get-Content $logFile -EA SilentlyContinue | Select-Object -Last 30
+            Get-Content $logFile -ErrorAction SilentlyContinue | Select-Object -Last 30
             exit 1
           }
 
-          # ── credentials banner ──────────────────────────────────
-          Write-Output ""
-          Write-Output "════════════════════════════════════════════"
-          Write-Output "  ✅  RDP READY"
-          Write-Output "════════════════════════════════════════════"
+          Write-Output "============================================"
+          Write-Output "  RDP READY"
+          Write-Output "============================================"
           Write-Output "  Address  : $tunnelUrl"
           Write-Output "  Username : $rdpUser"
           Write-Output "  Password : $rdpPass"
-          Write-Output "────────────────────────────────────────────"
-          Write-Output "  Win+R → mstsc → OK → $tunnelUrl"
-          Write-Output "════════════════════════════════════════════"
-          Write-Output ""
+          Write-Output "  Win+R -> mstsc -> $tunnelUrl"
+          Write-Output "============================================"
 
-          # Write connection info to Desktop for in-session reference
           $desk = "C:\Users\$rdpUser\Desktop"
           try {
-            if (-not (Test-Path $desk)) {
-              New-Item -ItemType Directory -Force -Path $desk | Out-Null
-            }
-            @"
-RDP Connection Details
-======================
-Address  : $tunnelUrl
-Username : $rdpUser
-Password : $rdpPass
-Backup   : every $bkpMin min  →  gofile.io
-"@ | Out-File "$desk\rdp-info.txt" -Encoding UTF8
+            New-Item -ItemType Directory -Force -Path $desk | Out-Null
+            $info  = "RDP Connection Details"
+            $info += "`nAddress  : $tunnelUrl"
+            $info += "`nUsername : $rdpUser"
+            $info += "`nPassword : $rdpPass"
+            $info | Out-File "$desk\rdp-info.txt" -Encoding UTF8
           } catch {}
 
-          # ── backup background job ───────────────────────────────
-          $bkpIntervalSec = $bkpMin * 60
-
-          $bkpJob = Start-Job -Name "BackupLoop" -ScriptBlock {
-            param(
-              [string] $Ws,
-              [string] $RdpUser,
-              [int]    $Interval,
-              [bool]   $ToastAvailable
-            )
-
-            # Redefined in job scope
-            function Notify {
-              param([string]$Title, [string]$Body)
-              $line = "[$( Get-Date -Format 'HH:mm:ss' )] $Title — $Body"
-              Write-Output "🔔 $line"
-              $desk = "C:\Users\$RdpUser\Desktop"
-              if (Test-Path $desk) {
-                try { $line | Out-File "$desk\backup-status.txt" -Append -Encoding UTF8 } catch {}
-              }
-              try { & msg $RdpUser "/time:60" "${Title}: $Body" > $null 2>&1 } catch {}
-              if ($ToastAvailable) {
-                try {
-                  Import-Module BurntToast -EA SilentlyContinue
-                  New-BurntToastNotification -Text $Title, $Body -EA SilentlyContinue
-                } catch {}
-              }
-            }
-
-            function Get-GoServer {
-              try {
-                $r  = Invoke-RestMethod "https://api.gofile.io/servers" -EA Stop
-                $eu = $r.data.servers | Where-Object { $_.zone -eq "eu" } |
-                      Select-Object -First 1
-                return $(if ($eu) { $eu.name } else { ($r.data.servers)[0].name })
-              } catch { return "store1" }
-            }
-
-            function Upload-GoFile {
-              param([string]$FilePath)
-              try {
-                $resp = Invoke-RestMethod `
-                  "https://$( Get-GoServer ).gofile.io/contents/uploadfile" `
-                  -Method Post -Form @{ file = Get-Item $FilePath } -EA Stop
-                if ($resp.status -eq "ok") { return $resp.data }
-              } catch { Write-Output "    ⚠️  Upload: $_" }
-              return $null
-            }
-
-            function Remove-GoFile {
-              param([string]$Id, [string]$Token)
-              if (-not $Id -or -not $Token) { return }
-              try {
-                Invoke-RestMethod "https://api.gofile.io/contents/$Id" `
-                  -Method  Delete `
-                  -Headers @{ Authorization = "Bearer $Token" } `
-                  -EA Stop | Out-Null
-                Write-Output "    🗑️  Deleted [$Id]"
-              } catch { Write-Output "    ⚠️  Delete: $_" }
-            }
-
-            # ── state ─────────────────────────────────────────────
-            $prevId    = $null
-            $prevToken = $null
-            $n         = 0
-            $tmpDir    = "$Ws\__backups"
-            New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-
-            # Seed the desktop status file
-            $desk = "C:\Users\$RdpUser\Desktop"
-            if (Test-Path $desk) {
-              try {
-                "RDP Backup Scheduler — interval: $([int]($Interval/60)) min" +
-                "`nNext backup : $( (Get-Date).AddSeconds($Interval).ToString('HH:mm:ss') )" +
-                "`n" | Out-File "$desk\backup-status.txt" -Encoding UTF8
-              } catch {}
-            }
-
-            # ── backup loop ────────────────────────────────────────
-            while ($true) {
-              Start-Sleep -Seconds $Interval
-
-              $n++
-              $ts  = Get-Date -Format "yyyy-MM-dd_HH-mm"
-              $zip = "$tmpDir\rdp-backup-$ts.zip"
-
-              Notify "RDP Backup #$n" "Starting at $ts"
-
-              # Collect the RDP user's working directories
-              $paths = @(
-                "C:\Users\$RdpUser\Desktop",
-                "C:\Users\$RdpUser\Documents",
-                "C:\Users\$RdpUser\Downloads"
-              ) | Where-Object { Test-Path $_ }
-
-              if ($paths.Count -eq 0) {
-                Notify "RDP Backup #$n" "⚠️ No paths found"
-                continue
-              }
-
-              # Zip
-              try {
-                Compress-Archive -Path $paths -DestinationPath $zip `
-                  -CompressionLevel Optimal -Force -EA Stop
-                $mb = [math]::Round((Get-Item $zip).Length / 1MB, 2)
-                Write-Output "    📦 $mb MB"
-              } catch {
-                Notify "RDP Backup #$n" "⚠️ Zip failed: $_"
-                continue
-              }
-
-              # Delete old remote backup BEFORE uploading the new one
-              Remove-GoFile -Id $prevId -Token $prevToken
-
-              # Upload
-              $data = Upload-GoFile -FilePath $zip
-              Remove-Item $zip -Force -EA SilentlyContinue
-
-              if ($data) {
-                # gofile.io returns guestToken or token depending on API version
-                $tok = if     ($data.PSObject.Properties["guestToken"]) { $data.guestToken }
-                       elseif ($data.PSObject.Properties["token"])      { $data.token }
-                       else                                              { $null }
-                $prevId    = $data.id
-                $prevToken = $tok
-
-                Notify "RDP Backup #$n" "✅ $($data.downloadPage)"
-                Write-Output "    ☁️  $($data.downloadPage)"
-
-                $desk = "C:\Users\$RdpUser\Desktop"
-                if (Test-Path $desk) {
-                  try {
-                    "Last backup  #$n at $ts" +
-                    "`nDownload     : $($data.downloadPage)" |
-                      Out-File "$desk\backup-status.txt" -Append -Encoding UTF8
-                  } catch {}
-                }
-              } else {
-                Notify "RDP Backup #$n" "⚠️ Upload failed"
-              }
-
-              # Update next-backup time
-              $desk = "C:\Users\$RdpUser\Desktop"
-              if (Test-Path $desk) {
-                try {
-                  "Next backup  : $( (Get-Date).AddSeconds($Interval).ToString('HH:mm:ss') )" +
-                  "`n" | Out-File "$desk\backup-status.txt" -Append -Encoding UTF8
-                } catch {}
-              }
-
-            } # end while
-          } -ArgumentList $ws, $rdpUser, $bkpIntervalSec, $toastOk
-
-          Write-Output "✅ Backup job #$($bkpJob.Id) started — fires every $bkpMin min"
-          Write-Output ""
-
-          # ── keepalive · log relay · ngrok watchdog ──────────────
           $tick = 0
           while ($true) {
             Start-Sleep -Seconds 60
             $tick++
 
-            # Drain backup job output into Actions log
-            Receive-Job -Job $bkpJob 2>&1 |
-              Where-Object { $_ } |
-              ForEach-Object { Write-Output "[backup] $_" }
-
-            # Ngrok watchdog: restart if the process exited
             if ($ngrokProc.HasExited) {
-              Write-Output "⚠️  Ngrok exited (code: $($ngrokProc.ExitCode)) — restarting…"
-              Clear-Content $logFile -EA SilentlyContinue
+              Write-Output "Ngrok exited (code: $($ngrokProc.ExitCode)) - restarting"
+              Clear-Content $logFile -ErrorAction SilentlyContinue
               $ngrokProc = Start-Ngrok
               Start-Sleep 8
-              Write-Output "🔄  Ngrok restarted — PID $($ngrokProc.Id)"
+              Write-Output "Ngrok restarted - PID $($ngrokProc.Id)"
             }
 
-            # Heartbeat — keeps Actions runner from timing out silently
             if ($tick % 10 -eq 0) {
-              Write-Output "⏱️  Session alive — $tick min elapsed"
+              Write-Output "Session alive - $tick min elapsed"
             }
           }
 
-      # ── CLEANUP ──────────────────────────────────────────────────
       - name: Cleanup
         if: always()
         shell: pwsh
         run: |
-          Stop-Process -Name "ngrok" -Force -EA SilentlyContinue
-          Get-Job | Stop-Job  -PassThru -EA SilentlyContinue |
-                    Remove-Job -Force  -EA SilentlyContinue
-          Write-Output "✅ Cleanup complete"
+          Stop-Process -Name "ngrok" -Force -ErrorAction SilentlyContinue
+          Write-Output "Cleanup complete"
